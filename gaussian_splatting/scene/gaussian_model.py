@@ -9,6 +9,7 @@
 # For inquiries contact  george.drettakis@inria.fr
 #
 
+import csv
 import os
 
 import numpy as np
@@ -245,12 +246,73 @@ class GaussianModel:
 
         rots = torch.zeros((fused_point_cloud.shape[0], 4), device="cuda")
         rots[:, 0] = 1
+        alpha_init = 0.5
+        m5c_applied = False
+        m5_cfg = self.config.get("M5C", {})
+        if (
+            bool(m5_cfg.get("enable", False))
+            and bool(m5_cfg.get("soft_opacity", False))
+            and (not init)
+            and (not add_dygs)
+        ):
+            valid = bool(getattr(cam, "m5_reliability_valid", False))
+            conf = getattr(cam, "m5_reliability_confidence", None)
+            if (
+                valid
+                and conf is not None
+                and np.isfinite(float(conf))
+                and float(conf) > 0.0
+            ):
+                # Frozen M5-C transfer rule from my-Flow4dgs:
+                # preserve the baseline ceiling and only attenuate low-trust
+                # insertions.
+                alpha_init = min(0.5, float(conf))
+                m5c_applied = True
+
         opacities = inverse_sigmoid(
-            0.5
+            alpha_init
             * torch.ones(
-                (fused_point_cloud.shape[0], 1), dtype=torch.float, device="cuda"
+                (fused_point_cloud.shape[0], 1),
+                dtype=torch.float,
+                device="cuda",
             )
         )
+
+        save_dir = self.config.get("Results", {}).get("save_dir")
+        if save_dir is not None:
+            path = os.path.join(save_dir, "m5c_opacity_initialization.csv")
+            exists = os.path.exists(path)
+            with open(path, "a", newline="") as fp:
+                writer = csv.writer(fp)
+                if not exists:
+                    writer.writerow(
+                        [
+                            "frame",
+                            "num_points",
+                            "init",
+                            "add_dygs",
+                            "m5_valid",
+                            "m5_confidence",
+                            "direct_flow_median_px",
+                            "training_ecdf",
+                            "alpha_init",
+                            "m5c_applied",
+                        ]
+                    )
+                writer.writerow(
+                    [
+                        int(getattr(cam, "uid", -1)),
+                        int(fused_point_cloud.shape[0]),
+                        int(bool(init)),
+                        int(bool(add_dygs)),
+                        int(bool(getattr(cam, "m5_reliability_valid", False))),
+                        getattr(cam, "m5_reliability_confidence", None),
+                        getattr(cam, "m5_direct_flow_median_px", None),
+                        getattr(cam, "m5_training_ecdf", None),
+                        float(alpha_init),
+                        int(bool(m5c_applied)),
+                    ]
+                )
 
         return fused_point_cloud, features, scales, rots, opacities
 
