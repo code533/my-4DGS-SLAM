@@ -181,9 +181,17 @@ class GaussianModel:
             depth = np.copy(cam_info.depth)
             depth[cam.motion_mask.cpu().numpy()] = 0
             depth = o3d.geometry.Image(depth.astype(np.float32))
-        return self.create_pcd_from_image_and_depth(cam, rgb, depth, init)
+        return self.create_pcd_from_image_and_depth(
+            cam,
+            rgb,
+            depth,
+            init,
+            add_dygs=add_dygs,
+        )
 
-    def create_pcd_from_image_and_depth(self, cam, rgb, depth, init=False):
+    def create_pcd_from_image_and_depth(
+        self, cam, rgb, depth, init=False, add_dygs=False
+    ):
         if init:
             downsample_factor = self.config["Dataset"]["pcd_downsample_init"]
         else:
