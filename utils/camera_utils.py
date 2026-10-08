@@ -85,6 +85,13 @@ class Camera(nn.Module):
         self.mask_fwd=None
         self.mask_bwd=None
 
+        # M5-C cross-system reliability state.  Neutral until explicitly
+        # computed on a keyframe candidate.
+        self.m5_reliability_valid = False
+        self.m5_reliability_confidence = 0.5
+        self.m5_direct_flow_median_px = None
+        self.m5_training_ecdf = None
+
     @staticmethod
     def init_from_dataset(dataset, idx, projection_matrix, model=None):
         gt_color, gt_depth, gt_pose, motion_mask = dataset[idx]
