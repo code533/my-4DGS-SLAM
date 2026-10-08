@@ -114,6 +114,11 @@ class FrontEnd(mp.Process):
         self.dynamic_model = config["model_params"]["dynamic_model"]
         self.dynamic_objects = 0
 
+        # CPU RGB ring buffer for causal M5-C t/t-1/t-2 flow diagnostics.
+        # This avoids re-entering Dataset.__getitem__ (and therefore avoids
+        # rerunning YOLO segmentation) just to recover historical RGB.
+        self.m5_rgb_history = {}
+
     def set_hyperparams(self):
         self.save_dir = self.config["Results"]["save_dir"]
         self.save_results = self.config["Results"]["save_results"]
@@ -574,6 +579,15 @@ class FrontEnd(mp.Process):
 
         return window, removed_frame
 
+    def _record_m5_rgb(self, frame_idx, image):
+        if not self.m5_enable:
+            return
+        self.m5_rgb_history[int(frame_idx)] = image.detach().cpu()
+        cutoff = int(frame_idx) - 2
+        for k in list(self.m5_rgb_history.keys()):
+            if k < cutoff:
+                del self.m5_rgb_history[k]
+
     def _ensure_m5_reliability(self):
         if (not self.m5_enable) or self.m5_reliability is not None:
             return
@@ -602,10 +616,8 @@ class FrontEnd(mp.Process):
 
         self._ensure_m5_reliability()
 
-        sample_tm1 = self.dataset[cur_frame_idx - 1]
-        sample_tm2 = self.dataset[cur_frame_idx - 2]
-        image_tm1 = sample_tm1[0]
-        image_tm2 = sample_tm2[0]
+        image_tm1 = self.m5_rgb_history.get(int(cur_frame_idx) - 1)
+        image_tm2 = self.m5_rgb_history.get(int(cur_frame_idx) - 2)
         if image_tm1 is None or image_tm2 is None:
             Log(
                 "M5-C historical RGB unavailable",
@@ -784,6 +796,7 @@ class FrontEnd(mp.Process):
                     self.dataset, cur_frame_idx, projection_matrix
                 )
                 viewpoint.compute_grad_mask(self.config)
+                self._record_m5_rgb(cur_frame_idx, viewpoint.original_image)
 
                 self.cameras[cur_frame_idx] = viewpoint
 
