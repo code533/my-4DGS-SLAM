@@ -11,6 +11,7 @@ from utils.camera_utils import Camera
 from utils.eval_utils import eval_ate, save_gaussians
 from utils.logging_utils import Log
 from utils.multiprocessing_utils import clone_obj
+from utils.m5_flow_reliability import M5CrossSystemReliability
 from utils.pose_utils import update_pose
 from utils.slam_utils import get_loss_tracking, get_median_depth, get_loss_network, pearson_loss
 from gaussian_splatting.utils.loss_utils import l1_loss, ssim
@@ -123,6 +124,20 @@ class FrontEnd(mp.Process):
         self.kf_interval = self.config["Training"]["kf_interval"]
         self.window_size = self.config["Training"]["window_size"]
         self.single_thread = self.config["Training"]["single_thread"]
+
+        m5_cfg = self.config.get("M5C", {})
+        self.m5_enable = bool(m5_cfg.get("enable", False))
+        self.m5_shadow_only = bool(m5_cfg.get("shadow_only", True))
+        self.m5_reference_file = m5_cfg.get(
+            "reference_file", "results/m5_direct_flow_reference.json"
+        )
+        self.m5_raft_model = m5_cfg.get(
+            "raft_model", "pretrained/raft-things.pth"
+        )
+        self.m5_min_pixels = int(m5_cfg.get("min_pixels", 500))
+        self.m5_eps = float(m5_cfg.get("confidence_eps", 1.0e-3))
+        self.m5_raft_iters = int(m5_cfg.get("raft_iters", 20))
+        self.m5_reliability = None
 
     def add_new_keyframe(self, cur_frame_idx, depth=None, opacity=None, init=False):
         rgb_boundary_threshold = self.config["Training"]["rgb_boundary_threshold"]
@@ -559,6 +574,98 @@ class FrontEnd(mp.Process):
 
         return window, removed_frame
 
+    def _ensure_m5_reliability(self):
+        if (not self.m5_enable) or self.m5_reliability is not None:
+            return
+        self.m5_reliability = M5CrossSystemReliability(
+            reference_file=self.m5_reference_file,
+            raft_model=self.m5_raft_model,
+            device=self.device,
+            eps=self.m5_eps,
+            min_pixels=self.m5_min_pixels,
+            raft_iters=self.m5_raft_iters,
+        )
+
+    def compute_m5_reliability(self, cur_frame_idx, viewpoint):
+        """Compute the frozen direct-flow reliability only when it can matter.
+
+        M5-C only changes new-Gaussian initialization, so the score is computed
+        on keyframes immediately before they are sent to the backend.
+        """
+        viewpoint.m5_reliability_valid = False
+        viewpoint.m5_reliability_confidence = 0.5
+        viewpoint.m5_direct_flow_median_px = None
+        viewpoint.m5_training_ecdf = None
+
+        if (not self.m5_enable) or int(cur_frame_idx) < 2:
+            return
+
+        self._ensure_m5_reliability()
+
+        sample_tm1 = self.dataset[cur_frame_idx - 1]
+        sample_tm2 = self.dataset[cur_frame_idx - 2]
+        image_tm1 = sample_tm1[0]
+        image_tm2 = sample_tm2[0]
+        if image_tm1 is None or image_tm2 is None:
+            Log(
+                "M5-C historical RGB unavailable",
+                cur_frame_idx,
+                tag="Frontend",
+            )
+            return
+
+        # In this codebase motion_mask=True is the retained/static region used
+        # by the mapping depth path.  Use exactly that region as the spatial
+        # prior, then intersect it with M5 FB consistency internally.
+        if viewpoint.motion_mask is None:
+            static_mask = torch.ones(
+                (viewpoint.image_height, viewpoint.image_width),
+                dtype=torch.bool,
+                device=viewpoint.original_image.device,
+            )
+        else:
+            static_mask = viewpoint.motion_mask.to(
+                device=viewpoint.original_image.device,
+                dtype=torch.bool,
+            )
+
+        result = self.m5_reliability.evaluate_images(
+            viewpoint.original_image,
+            image_tm1.to(
+                device=viewpoint.original_image.device,
+                dtype=viewpoint.original_image.dtype,
+            ),
+            image_tm2.to(
+                device=viewpoint.original_image.device,
+                dtype=viewpoint.original_image.dtype,
+            ),
+            static_mask,
+        )
+        viewpoint.m5_reliability_valid = bool(result["valid"])
+        viewpoint.m5_reliability_confidence = float(result["confidence"])
+        viewpoint.m5_direct_flow_median_px = result["direct_flow_median_px"]
+        viewpoint.m5_training_ecdf = result["training_ecdf"]
+        self.m5_reliability.save(
+            result,
+            frame=viewpoint.uid,
+            save_dir=self.save_dir,
+        )
+        Log(
+            "M5-C frame",
+            int(viewpoint.uid),
+            "valid",
+            bool(result["valid"]),
+            "N",
+            int(result["num_valid_pixels"]),
+            "direct_flow_px",
+            result["direct_flow_median_px"],
+            "ecdf",
+            result["training_ecdf"],
+            "confidence",
+            float(result["confidence"]),
+            tag="Frontend",
+        )
+
     def request_keyframe(self, cur_frame_idx, viewpoint, current_window, depthmap, add_new_gaussian=True, dynamic_render=False):
         msg = ["keyframe", cur_frame_idx, viewpoint, current_window, depthmap, add_new_gaussian, dynamic_render]
         self.backend_queue.put(msg)
@@ -761,6 +868,11 @@ class FrontEnd(mp.Process):
                     new_object = False
                     
                 if create_kf:
+                    # Shadow and active M5-C runs execute the same reliability
+                    # computation.  The backend decides whether confidence is
+                    # used for opacity initialization.
+                    self.compute_m5_reliability(cur_frame_idx, viewpoint)
+
                     keyframe_list.append(cur_frame_idx)
                     self.current_window, removed = self.add_to_window(
                         cur_frame_idx,
