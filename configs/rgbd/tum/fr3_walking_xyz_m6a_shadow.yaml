@@ -1,0 +1,19 @@
+inherit_from: "configs/rgbd/tum/fr3_walking_xyz.yaml"
+
+Results:
+  use_gui: False
+  eval_rendering: True
+
+M5C:
+  enable: True
+  soft_opacity: False
+  reference_file: "results/m5_direct_flow_reference.json"
+  raft_model: "pretrained/raft-things.pth"
+  min_pixels: 500
+  confidence_eps: 0.001
+  raft_iters: 20
+
+M6A:
+  enable: False
+  confidence_threshold: 0.20
+  extra_pose_iters: 20
