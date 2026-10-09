@@ -165,6 +165,12 @@ class M5CrossSystemReliability:
         self.raft = model.module.to(self.device)
         self.raft.eval()
 
+        # Exact-flow cache used by M6-A.  Consecutive frames reuse
+        # F(t-1 -> t-2) from the previous frame's F(t -> t-1), so the
+        # reliability definition is unchanged while avoiding one redundant
+        # RAFT forward pass per frame.
+        self.flow_cache = {}
+
     def ecdf(self, direct_flow_median_px):
         idx = bisect.bisect_right(self.values, float(direct_flow_median_px))
         return float(idx / self.n)
@@ -185,11 +191,41 @@ class M5CrossSystemReliability:
         return padder.unpad(flow[0])
 
     @torch.no_grad()
-    def evaluate_images(self, image_t, image_tm1, image_tm2, static_mask):
-        f10 = self._flow(image_t, image_tm1)
-        f01 = self._flow(image_tm1, image_t)
-        f21 = self._flow(image_tm1, image_tm2)
-        f20 = self._flow(image_t, image_tm2)
+    def _flow_cached(self, key, image_from, image_to):
+        if key in self.flow_cache:
+            return self.flow_cache[key]
+        flow = self._flow(image_from, image_to)
+        self.flow_cache[key] = flow
+        return flow
+
+    def _prune_flow_cache(self, frame_idx):
+        keep_from = int(frame_idx) - 2
+        for key in list(self.flow_cache.keys()):
+            a, b = key
+            if max(a, b) < keep_from:
+                del self.flow_cache[key]
+
+    @torch.no_grad()
+    def evaluate_images(
+        self,
+        image_t,
+        image_tm1,
+        image_tm2,
+        static_mask,
+        frame_idx=None,
+    ):
+        if frame_idx is None:
+            f10 = self._flow(image_t, image_tm1)
+            f01 = self._flow(image_tm1, image_t)
+            f21 = self._flow(image_tm1, image_tm2)
+            f20 = self._flow(image_t, image_tm2)
+        else:
+            t = int(frame_idx)
+            f10 = self._flow_cached((t, t - 1), image_t, image_tm1)
+            f01 = self._flow_cached((t - 1, t), image_tm1, image_t)
+            f21 = self._flow_cached((t - 1, t - 2), image_tm1, image_tm2)
+            f20 = self._flow_cached((t, t - 2), image_t, image_tm2)
+            self._prune_flow_cache(t)
 
         fb_valid = fb_valid_mask(f10, f01)
         static = static_mask.to(device=f10.device, dtype=torch.bool)
