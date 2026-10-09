@@ -1,3 +1,4 @@
+import csv
 import time
 
 import numpy as np
@@ -143,6 +144,19 @@ class FrontEnd(mp.Process):
         self.m5_eps = float(m5_cfg.get("confidence_eps", 1.0e-3))
         self.m5_raft_iters = int(m5_cfg.get("raft_iters", 20))
         self.m5_reliability = None
+
+        m6_cfg = self.config.get("M6A", {})
+        self.m6a_enable = bool(m6_cfg.get("enable", False))
+        self.m6a_conf_threshold = float(
+            m6_cfg.get("confidence_threshold", 0.20)
+        )
+        self.m6a_extra_iters = int(m6_cfg.get("extra_pose_iters", 20))
+        if self.m6a_enable and not self.m5_enable:
+            raise ValueError("M6-A requires M5C.enable=true for reliability")
+        if not (0.0 <= self.m6a_conf_threshold <= 1.0):
+            raise ValueError("M6-A confidence_threshold must be in [0,1]")
+        if self.m6a_extra_iters < 1:
+            raise ValueError("M6-A extra_pose_iters must be >= 1")
 
     def add_new_keyframe(self, cur_frame_idx, depth=None, opacity=None, init=False):
         rgb_boundary_threshold = self.config["Training"]["rgb_boundary_threshold"]
@@ -480,6 +494,121 @@ class FrontEnd(mp.Process):
             if converged:
                 break
 
+        # M6-A: add fixed extra pose-only refinement on low-reliability
+        # frames.  Baseline tracking above is untouched.  Exposure gradients
+        # are explicitly suppressed during this second stage.
+        m6_valid = bool(getattr(viewpoint, "m5_reliability_valid", False))
+        m6_conf = float(getattr(viewpoint, "m5_reliability_confidence", 0.5))
+        m6_trigger = (
+            self.m6a_enable
+            and m6_valid
+            and np.isfinite(m6_conf)
+            and m6_conf < self.m6a_conf_threshold
+        )
+
+        extra_done = 0
+        delta_t_m = 0.0
+        delta_r_rad = 0.0
+        if m6_trigger:
+            R_before = viewpoint.R.detach().clone()
+            T_before = viewpoint.T.detach().clone()
+
+            for extra_itr in range(self.m6a_extra_iters):
+                render_pkg_extra = render(
+                    viewpoint,
+                    self.gaussians,
+                    self.pipeline_params,
+                    self.background,
+                    dynamic=False,
+                    dx=dxyz,
+                    ds=d_scale,
+                    dr=d_rot,
+                    mask=(self.gaussians.dygs == False),
+                )
+                image_extra = render_pkg_extra["render"]
+                depth_extra = render_pkg_extra["depth"]
+                opacity_extra = render_pkg_extra["opacity"]
+
+                loss_extra = get_loss_tracking(
+                    self.config,
+                    image_extra,
+                    depth_extra,
+                    opacity_extra,
+                    viewpoint,
+                    rm_dynamic=True,
+                    mask=None,
+                    save_img=False,
+                )
+                loss_extra.backward()
+
+                # Pose-only: prevent the shared optimizer from updating
+                # exposure during the extra stage.
+                viewpoint.exposure_a.grad = None
+                viewpoint.exposure_b.grad = None
+
+                with torch.no_grad():
+                    pose_optimizer.step()
+                    pose_optimizer.zero_grad()
+                    self.gaussians.deform.optimizer.zero_grad(set_to_none=True)
+                    self.gaussians.optimizer.zero_grad(set_to_none=True)
+                    update_pose(viewpoint)
+
+                extra_done += 1
+
+            with torch.no_grad():
+                delta_t_m = float(torch.norm(viewpoint.T - T_before).cpu())
+                delta_R = viewpoint.R @ R_before.transpose(0, 1)
+                tr = torch.clamp(
+                    (torch.trace(delta_R) - 1.0) / 2.0,
+                    -1.0,
+                    1.0,
+                )
+                delta_r_rad = float(torch.acos(tr).cpu())
+
+        if self.m5_enable:
+            audit_path = os.path.join(self.save_dir, "m6a_pose_refinement.csv")
+            exists = os.path.exists(audit_path)
+            with open(audit_path, "a", newline="") as fp:
+                writer = csv.writer(fp)
+                if not exists:
+                    writer.writerow(
+                        [
+                            "frame",
+                            "m5_valid",
+                            "confidence",
+                            "triggered",
+                            "extra_iters",
+                            "extra_delta_t_m",
+                            "extra_delta_r_rad",
+                        ]
+                    )
+                writer.writerow(
+                    [
+                        int(viewpoint.uid),
+                        int(m6_valid),
+                        m6_conf,
+                        int(m6_trigger),
+                        int(extra_done),
+                        delta_t_m,
+                        delta_r_rad,
+                    ]
+                )
+
+        if m6_trigger:
+            Log(
+                "M6-A refine frame",
+                int(viewpoint.uid),
+                "confidence",
+                m6_conf,
+                "extra_iters",
+                extra_done,
+                "delta_t_m",
+                delta_t_m,
+                "delta_r_rad",
+                delta_r_rad,
+                tag="Frontend",
+            )
+
         self.median_depth = get_median_depth(depth, opacity)
         
         with torch.no_grad():
@@ -601,10 +730,11 @@ class FrontEnd(mp.Process):
         )
 
     def compute_m5_reliability(self, cur_frame_idx, viewpoint):
-        """Compute the frozen direct-flow reliability only when it can matter.
+        """Compute the frozen direct-flow reliability for the current frame.
 
-        M5-C only changes new-Gaussian initialization, so the score is computed
-        on keyframes immediately before they are sent to the backend.
+        M6-A needs the score before tracking so low-reliability frames can
+        receive extra pose refinement.  Shadow and refine runs execute this
+        identical diagnostic path.
         """
         viewpoint.m5_reliability_valid = False
         viewpoint.m5_reliability_confidence = 0.5
@@ -652,6 +782,7 @@ class FrontEnd(mp.Process):
                 dtype=viewpoint.original_image.dtype,
             ),
             static_mask,
+            frame_idx=cur_frame_idx,
         )
         viewpoint.m5_reliability_valid = bool(result["valid"])
         viewpoint.m5_reliability_confidence = float(result["confidence"])
@@ -663,7 +794,7 @@ class FrontEnd(mp.Process):
             save_dir=self.save_dir,
         )
         Log(
-            "M5-C frame",
+            "M6 reliability frame",
             int(viewpoint.uid),
             "valid",
             bool(result["valid"]),
@@ -810,6 +941,11 @@ class FrontEnd(mp.Process):
                     len(self.current_window) == self.window_size
                 )
                 
+                # M6-A requires reliability before pose optimization.  The
+                # current RGB has already been recorded in the causal ring
+                # buffer above, so frames t-1/t-2 are available from t>=2.
+                self.compute_m5_reliability(cur_frame_idx, viewpoint)
+
                 # Tracking
                 render_pkg = self.tracking(cur_frame_idx, viewpoint, last_keyframe_idx)
                 #print(cur_frame_idx, "Tracking Complete ")
@@ -881,11 +1017,6 @@ class FrontEnd(mp.Process):
                     new_object = False
                     
                 if create_kf:
-                    # Shadow and active M5-C runs execute the same reliability
-                    # computation.  The backend decides whether confidence is
-                    # used for opacity initialization.
-                    self.compute_m5_reliability(cur_frame_idx, viewpoint)
-
                     keyframe_list.append(cur_frame_idx)
                     self.current_window, removed = self.add_to_window(
                         cur_frame_idx,
